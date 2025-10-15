@@ -1,4 +1,4 @@
-# app_llm.py — Streamlit 배포용(Playground 스타일, Secrets 사용, 헬스체크 포함)
+# app_llm.py — Streamlit 배포용 최신본 (st.query_params, Secrets, 프로젝트키, 스트리밍 폴백)
 import os, re, streamlit as st
 from openai import OpenAI
 
@@ -13,19 +13,21 @@ def get_secret(name: str, default: str = "") -> str:
 
 def get_query_param(name: str, default: str = "") -> str:
     try:
-        # 1.36~: experimental_get_query_params 사용
-        qp = st.experimental_get_query_params()
-        v = qp.get(name, [default])
-        return v[0] if isinstance(v, list) else (v or default)
+        qp = st.query_params  # ✅ 최신 API
+        v = qp.get(name, default)
+        if isinstance(v, list):
+            return v[0] if v else default
+        return v or default
     except Exception:
         return default
 
 # -------------------- 사이드바 --------------------
 with st.sidebar:
     st.subheader("⚙️ Settings")
-    api_key   = st.text_input("OPENAI_API_KEY", type="password", value=get_secret("OPENAI_API_KEY",""))
-    base_url  = st.text_input("OPENAI_BASE_URL (선택)", value=get_secret("OPENAI_BASE_URL",""))
-    model     = st.text_input("Model", value=get_secret("OPENAI_MODEL","gpt-4o-mini"))
+    api_key     = st.text_input("OPENAI_API_KEY", type="password", value=get_secret("OPENAI_API_KEY",""))
+    base_url    = st.text_input("OPENAI_BASE_URL (선택)", value=get_secret("OPENAI_BASE_URL",""))
+    model       = st.text_input("Model", value=get_secret("OPENAI_MODEL","gpt-4o-mini"))
+    project_id  = st.text_input("OPENAI_PROJECT (proj_..., 선택)", value=get_secret("OPENAI_PROJECT",""))
     temperature = st.slider("Temperature", 0.0, 1.0, 0.0, 0.05)  # 결정적 출력 유지
     typecode_qp = st.text_input("TypeCode(선택, 1~8)", value=get_query_param("type",""))
     show_debug  = st.checkbox("디버그(시스템 메시지 표시)", value=False)
@@ -33,18 +35,20 @@ with st.sidebar:
 
 # -------------------- 키/URL 검증 & 클라이언트 --------------------
 if not api_key or not api_key.startswith("sk-"):
-    st.error("OpenAI API 키가 없거나 형식이 올바르지 않습니다. (배포 대시보드의 Edit secrets에서 OPENAI_API_KEY 설정)")
+    st.error("OpenAI API 키가 없거나 형식이 올바르지 않습니다. (대시보드 Edit secrets의 OPENAI_API_KEY 확인)")
     st.stop()
 if base_url.strip() and not base_url.startswith("http"):
     st.error("OPENAI_BASE_URL이 올바른 URL이 아닙니다. 프록시/Azure를 쓰지 않으면 빈칸으로 두세요.")
     st.stop()
 
 client_kwargs = {"api_key": api_key}
+if project_id.strip():
+    client_kwargs["project"] = project_id.strip()  # ✅ 프로젝트 키 대응
 if base_url.strip():
     client_kwargs["base_url"] = base_url.strip()
 client = OpenAI(**client_kwargs)
 
-# 최초 1회 연결 헬스체크(즉시 오류 노출)
+# 최초 1회 연결 헬스체크(즉시 오류 노출, 비스트리밍으로 짧게)
 if "health_ok" not in st.session_state:
     try:
         _ = client.chat.completions.create(
@@ -54,7 +58,13 @@ if "health_ok" not in st.session_state:
         )
         st.session_state.health_ok = True
     except Exception as e:
-        st.error(f"OpenAI 연결 실패: {e}\n• Edit secrets에서 OPENAI_API_KEY/OPENAI_BASE_URL/OPENAI_MODEL을 확인하세요.\n• 프록시 미사용 시 OPENAI_BASE_URL은 빈칸.")
+        st.error(
+            "OpenAI 연결 실패: {}\n"
+            "• Edit secrets에서 OPENAI_API_KEY / OPENAI_MODEL / (선택) OPENAI_PROJECT를 확인하세요.\n"
+            "• 프록시 미사용 시 OPENAI_BASE_URL은 빈칸으로 두세요.\n"
+            "• 로컬에서 정상인데 Cloud만 실패하면, Cloud 네트워크 이슈 가능성이 큽니다."
+            .format(e)
+        )
         st.stop()
 
 # -------------------- 프롬프트(시스템은 화면 비노출) --------------------
@@ -175,17 +185,28 @@ def init_session():
 if ("messages" not in st.session_state) or clear:
     init_session()
 
-# -------------------- OpenAI 스트리밍 --------------------
+# -------------------- OpenAI 호출 (스트리밍 + 폴백) --------------------
+def ask_openai(messages, model, temperature):
+    """비스트리밍 1회 요청(헬스/폴백용)"""
+    resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
+    return resp.choices[0].message.content
+
 def stream_chat(messages, model, temperature):
-    with client.chat.completions.stream(model=model, messages=messages, temperature=temperature) as stream:
-        acc = ""
-        for event in stream:
-            if event.type == "token":
-                acc += event.token
-                yield event.token
-            elif event.type == "completed":
-                break
-        return acc
+    """기본은 스트리밍, 실패 시 비스트리밍으로 폴백"""
+    try:
+        with client.chat.completions.stream(model=model, messages=messages, temperature=temperature) as stream:
+            buf = ""
+            for event in stream:
+                if event.type == "token":
+                    buf += event.token
+                    yield event.token
+                elif event.type == "completed":
+                    break
+            return buf
+    except Exception:
+        content = ask_openai(messages, model, temperature)
+        yield content
+        return content
 
 # -------------------- 렌더(시스템 숨김) --------------------
 for m in st.session_state.messages:
